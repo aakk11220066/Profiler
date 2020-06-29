@@ -8,7 +8,12 @@
 #include <sys/user.h>
 #include <exception>
 
-#define C_TRYCATCH(syscall) if ((syscall) < 0) exit(1)
+void myExit(int retVal){
+    perror("ptrace");
+    exit(retVal);
+}
+
+#define C_TRYCATCH(syscall) if ((syscall) < 0) myExit(1)
 #define C_CATCHERR(retVal) if (retVal < 0) exit(1)
 
 #define DEFAULT_ERRNO 0
@@ -25,18 +30,18 @@ std::map<std::string, std::string> getRegisterMap();
 
 //inserts given byte at requested address
 //returns overwritten byte
-char insertByte(void *targetAddress, pid_t debuggee, char replacement);
+unsigned char insertByte(void *targetAddress, pid_t debuggee, unsigned char replacement);
 
 //inserts debug interrupt at requested address
 //returns overwritten byte
-char insertBreakpoint(void* breakpointAddress, pid_t debuggee);
+unsigned char insertBreakpoint(void* breakpointAddress, pid_t debuggee);
 
 //1. restores overwritten byte to original placement
 //2. backs up rip by one instruction (one byte)
 //3. runs a single instruction of debuggee
 //4. replaces debug interrupt back into breakpointAddress
 //5. resumes ordinary run of debuggee
-void resumeRun(void* breakpointAddress, char replacedByte, pid_t debuggee);
+void resumeRun(void* breakpointAddress, unsigned char replacedByte, pid_t debuggee);
 
 //1. places trace on self (with ptrace(PTRACE_TRACEME))
 //2. execute debuggee program
@@ -70,10 +75,6 @@ void runDebugger(char *programArgs[], void *beginAddress, void *endAddress,
 int main(int argc, char* argv[]) {
     std::map<std::string,std::string> variableMap = getRegisterMap(); //mapping of variableName,register name
 
-    //assemble program command
-    std::string programCmd = std::string();
-    for (int i=3; i<argc; ++i) programCmd += std::string(" ") + argv[i];
-
     registerContent beginAddress = 0;
     registerContent endAddress = 0;
     if (sscanf(argv[1], "%llx", &beginAddress) == EOF) exit(1);
@@ -103,26 +104,28 @@ std::map<std::string, std::string> getRegisterMap(){
 
 //inserts given byte at requested address
 //returns overwritten byte
-char insertByte(void *targetAddress, pid_t debuggee, char replacement) {
+unsigned char insertByte(void *targetAddress, pid_t debuggee, unsigned char replacement) {
+
     //get word that will be overwritten
-    long modifiedWord = ptrace(PTRACE_PEEKTEXT, debuggee, targetAddress, nullptr);
+    unsigned long modifiedWord = ptrace(PTRACE_PEEKTEXT, debuggee, targetAddress, nullptr);
     if (errno != DEFAULT_ERRNO) C_CATCHERR(modifiedWord);
-    char replacedByte = (char) modifiedWord;
+    unsigned char replacedByte = (unsigned char) modifiedWord;
 
     //replace first byte of word with debug interrupt
-    const long debugInterruptCode = replacement;
-    const long clearMask = 0xffffff00;
-    modifiedWord = (modifiedWord & clearMask) | debugInterruptCode;
+    const unsigned long debugInterruptCode = replacement;
+    const unsigned long clearMask = 0xffffffffffffff00;
+    modifiedWord = (modifiedWord & clearMask);
+    modifiedWord |= debugInterruptCode;
 
     //poketext word in
-    C_TRYCATCH(ptrace(PTRACE_POKETEXT, debuggee, targetAddress, (void*) &modifiedWord));
+    C_TRYCATCH(ptrace(PTRACE_POKETEXT, debuggee, targetAddress, (void*) modifiedWord));
 
     return replacedByte;
 }
 
 //inserts debug interrupt at requested address
 //returns overwritten byte
-char insertBreakpoint(void *breakpointAddress, pid_t debuggee) {
+unsigned char insertBreakpoint(void *breakpointAddress, pid_t debuggee) {
     return insertByte(breakpointAddress, debuggee, 0xcc);
 }
 
@@ -131,9 +134,10 @@ char insertBreakpoint(void *breakpointAddress, pid_t debuggee) {
 //3. runs a single instruction of debuggee
 //4. replaces debug interrupt back into breakpointAddress
 //5. resumes ordinary run of debuggee
-void resumeRun(void* breakpointAddress, char replacedByte, pid_t debuggee){
+void resumeRun(void* breakpointAddress, unsigned char replacedByte, pid_t debuggee){
+    pid_t debuggeeCopy = debuggee; //DEBUG
     //1. restores overwritten byte to original placement
-    insertByte(breakpointAddress, replacedByte, debuggee);
+    insertByte(breakpointAddress, debuggee, replacedByte);
 
     //2. backs up rip by one instruction (one byte)
     struct user_regs_struct debuggeeRegisters;
@@ -143,6 +147,8 @@ void resumeRun(void* breakpointAddress, char replacedByte, pid_t debuggee){
 
     //3. runs a single instruction of debuggee
     C_TRYCATCH(ptrace(PTRACE_SINGLESTEP, debuggee, nullptr, nullptr));
+    int debugeeSinglestepStatus = 0;
+    C_TRYCATCH(wait(&debugeeSinglestepStatus)); //wait for debuggee to return from singlestep
 
     //4. replaces debug interrupt back into breakpointAddress
     insertBreakpoint(breakpointAddress, debuggee);
@@ -262,9 +268,10 @@ void runDebugger(char *programArgs[], void *beginAddress, void *endAddress,
     //debugger process continues here
 
     //run debugged process
-    char replacedBeginByte = insertBreakpoint(beginAddress, debuggee);
-    char replacedEndByte = insertBreakpoint(endAddress, debuggee);
     int debuggeeStatus = 0;
+    C_TRYCATCH(wait(&debuggeeStatus)); //wait for debuggee to finish loading program
+    unsigned char replacedBeginByte = insertBreakpoint(beginAddress, debuggee);
+    unsigned char replacedEndByte = insertBreakpoint(endAddress, debuggee);
 
     startDebuggeeRun(debuggee);
     do { //FIXME: possible bug: if debuggee receives a signal during run, will return control to debugger before reached inspected code, and debugger will return no signal (instead of caught signal)
