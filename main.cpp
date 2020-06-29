@@ -8,13 +8,10 @@
 #include <sys/user.h>
 #include <exception>
 
-#define C_TRYCATCH1(syscall, errcode) if ((errcode) == (syscall)) exit(1)
-#define C_TRYCATCH2(syscall) if ((syscall) < 0) exit(1)
+#define C_TRYCATCH(syscall) if ((syscall) < 0) exit(1)
 #define C_CATCHERR(retVal) if (retVal < 0) exit(1)
 
 #define DEFAULT_ERRNO 0
-
-//TODO: catch other types of registers as well (e.g. ax, al, bx, eax,...)
 
 namespace ProfilerExceptions{
     class ProfilerException : public std::exception{};
@@ -44,7 +41,7 @@ void resumeRun(void* breakpointAddress, char replacedByte, pid_t debuggee);
 //1. places trace on self (with ptrace(PTRACE_TRACEME))
 //2. execute debuggee program
 //3. wait to begin actual run until told to continue, to allow time for emplacement of breakpoints
-void loadDebuggedProgram(const std::string &programPath, const std::string &programCmd);
+void loadDebuggedProgram(char* programArgs[]);
 
 //Returns the value of a requested register (given by register name) from a user_regs_struct
 registerContent getVarValueFromUser_regs_struct(const struct user_regs_struct& regs, const std::string& requestedRegister);
@@ -65,7 +62,7 @@ void compareVariables(
 void startDebuggeeRun(pid_t debuggee);
 
 //manage debugging the code
-void runDebugger(const std::string &programPath, const std::string &programCmd, void *beginAddress, void *endAddress,
+void runDebugger(char *programArgs[], void *beginAddress, void *endAddress,
                  const std::map<std::string, std::string> &variableMap);
 
 
@@ -79,10 +76,11 @@ int main(int argc, char* argv[]) {
 
     registerContent beginAddress = 0;
     registerContent endAddress = 0;
-    C_TRYCATCH1(sscanf(argv[1], "%llx", &beginAddress), EOF);
-    C_TRYCATCH1(sscanf(argv[2], "%llx", &endAddress), EOF);
+    if (sscanf(argv[1], "%llx", &beginAddress) == EOF) exit(1);
+    if (sscanf(argv[2], "%llx", &endAddress) == EOF) exit(1);
 
-    runDebugger(argv[3], programCmd, (void *) beginAddress, (void *) endAddress, variableMap);
+    //note: argv is null-terminated
+    runDebugger(argv+3, (void *) beginAddress, (void *) endAddress, variableMap);
 
     return 0;
 }
@@ -91,10 +89,10 @@ int main(int argc, char* argv[]) {
 std::map<std::string, std::string> getRegisterMap(){
     std::string variable = std::string();
     std::string strRegister = std::string();
-    std::map<std::string,std::string> result; //FIXME: possible bug: may be deleted at end of function
+    std::map<std::string,std::string> result;
 
     do{
-        std::cin >> variable; //FIXME: may cause a bug by getting deleted at scope end
+        std::cin >> variable;
         std::cin >> strRegister;
         result.insert(std::pair<std::string,std::string>(variable,strRegister));
     } while (variable.compare("run") && strRegister.compare("profile"));
@@ -117,7 +115,7 @@ char insertByte(void *targetAddress, pid_t debuggee, char replacement) {
     modifiedWord = (modifiedWord & clearMask) | debugInterruptCode;
 
     //poketext word in
-    C_TRYCATCH2(ptrace(PTRACE_POKETEXT, debuggee, targetAddress, (void*) &modifiedWord));
+    C_TRYCATCH(ptrace(PTRACE_POKETEXT, debuggee, targetAddress, (void*) &modifiedWord));
 
     return replacedByte;
 }
@@ -139,53 +137,77 @@ void resumeRun(void* breakpointAddress, char replacedByte, pid_t debuggee){
 
     //2. backs up rip by one instruction (one byte)
     struct user_regs_struct debuggeeRegisters;
-    C_TRYCATCH2(ptrace(PTRACE_GETREGS, debuggee, nullptr, &debuggeeRegisters));
+    C_TRYCATCH(ptrace(PTRACE_GETREGS, debuggee, nullptr, &debuggeeRegisters));
     --debuggeeRegisters.rip;
-    C_TRYCATCH2(ptrace(PTRACE_SETREGS, debuggee, nullptr, &debuggeeRegisters));
+    C_TRYCATCH(ptrace(PTRACE_SETREGS, debuggee, nullptr, &debuggeeRegisters));
 
     //3. runs a single instruction of debuggee
-    C_TRYCATCH2(ptrace(PTRACE_SINGLESTEP, debuggee, nullptr, nullptr));
+    C_TRYCATCH(ptrace(PTRACE_SINGLESTEP, debuggee, nullptr, nullptr));
 
     //4. replaces debug interrupt back into breakpointAddress
     insertBreakpoint(breakpointAddress, debuggee);
 
     //5. resumes ordinary run of debuggee
-    C_TRYCATCH2(ptrace(PTRACE_CONT, debuggee, nullptr, nullptr));
+    C_TRYCATCH(ptrace(PTRACE_CONT, debuggee, nullptr, nullptr));
 }
 
 //1. places trace on self (with ptrace(PTRACE_TRACEME))
 //2. execute debuggee program
 //3. wait to begin actual run until told to continue, to allow time for emplacement of breakpoints
-void loadDebuggedProgram(const std::string &programPath, const std::string &programCmd) {
+void loadDebuggedProgram(char* programArgs[]) {
     //1. places trace on self (with ptrace(PTRACE_TRACEME))
     const pid_t SELF = 0;
-    C_TRYCATCH2(ptrace(PTRACE_TRACEME, SELF, nullptr, nullptr));
+    C_TRYCATCH(ptrace(PTRACE_TRACEME, SELF, nullptr, nullptr));
 
     //2. execute debuggee program
-    C_TRYCATCH2(execl(programPath.c_str(), programCmd.c_str()));
+    C_TRYCATCH(execv(programArgs[0], programArgs));
 
     //3. wait to begin actual run until told to continue, to allow time for emplacement of breakpoints
 }
 
 //Returns the value of a requested register (given by register name) from a user_regs_struct
 registerContent getVarValueFromUser_regs_struct(const struct user_regs_struct &regs, const std::string &requestedRegister) {
+    //64-bit registers
     if (!requestedRegister.compare("rax")) return regs.rax;
     if (!requestedRegister.compare("rbx")) return regs.rbx;
     if (!requestedRegister.compare("rcx")) return regs.rcx;
     if (!requestedRegister.compare("rdx")) return regs.rdx;
-    if (!requestedRegister.compare("rbp")) return regs.rbp;
-    if (!requestedRegister.compare("rsp")) return regs.rsp;
     if (!requestedRegister.compare("rsi")) return regs.rsi;
-    if (!requestedRegister.compare("rdi")) return regs.rdi;
 
-    if (!requestedRegister.compare("r8")) return regs.r8;
-    if (!requestedRegister.compare("r9")) return regs.r9;
-    if (!requestedRegister.compare("r10")) return regs.r10;
-    if (!requestedRegister.compare("r11")) return regs.r11;
-    if (!requestedRegister.compare("r12")) return regs.r12;
-    if (!requestedRegister.compare("r13")) return regs.r13;
-    if (!requestedRegister.compare("r14")) return regs.r14;
-    if (!requestedRegister.compare("r15")) return regs.r15;
+    //32-bit registers
+    if (!requestedRegister.compare("eax")) return (unsigned long long int)(unsigned int) regs.rax;
+    if (!requestedRegister.compare("ebx")) return (unsigned long long int)(unsigned int) regs.rbx;
+    if (!requestedRegister.compare("ecx")) return (unsigned long long int)(unsigned int) regs.rcx;
+    if (!requestedRegister.compare("edx")) return (unsigned long long int)(unsigned int) regs.rdx;
+    if (!requestedRegister.compare("esi")) return (unsigned long long int)(unsigned int) regs.rsi;
+
+    //16-bit registers
+    if (!requestedRegister.compare("ax")) return (unsigned long long int)(unsigned short) regs.rax;
+    if (!requestedRegister.compare("bx")) return (unsigned long long int)(unsigned short) regs.rbx;
+    if (!requestedRegister.compare("cx")) return (unsigned long long int)(unsigned short) regs.rcx;
+    if (!requestedRegister.compare("dx")) return (unsigned long long int)(unsigned short) regs.rdx;
+    if (!requestedRegister.compare("si")) return (unsigned long long int)(unsigned short) regs.rsi;
+
+    //8-bit low registers
+    if (!requestedRegister.compare("al")) return (unsigned long long int)(unsigned char) regs.rax;
+    if (!requestedRegister.compare("bl")) return (unsigned long long int)(unsigned char) regs.rbx;
+    if (!requestedRegister.compare("cl")) return (unsigned long long int)(unsigned char) regs.rcx;
+    if (!requestedRegister.compare("dl")) return (unsigned long long int)(unsigned char) regs.rdx;
+    if (!requestedRegister.compare("sil")) return (unsigned long long int)(unsigned char) regs.rsi;
+
+    //8-bit high registers
+    if (!requestedRegister.compare("ah")) return
+                ((unsigned long long int)(((unsigned short) regs.rax)) >> 8);
+    if (!requestedRegister.compare("bh")) return
+                ((unsigned long long int)(((unsigned short) regs.rbx)) >> 8);
+    if (!requestedRegister.compare("ch")) return
+                ((unsigned long long int)(((unsigned short) regs.rcx)) >> 8);
+    if (!requestedRegister.compare("dh")) return
+                ((unsigned long long int)(((unsigned short) regs.rdx)) >> 8);
+    //not an intel register:
+    // if (!requestedRegister.compare("sih")) return
+    //      ((unsigned long long int)(((unsigned short) regs.rsi)) >> 8);
+
     throw ProfilerExceptions::NotARegister();
 }
 
@@ -194,11 +216,11 @@ std::map<std::string, registerContent> storeVariables(const std::map<std::string
     std::map<std::string, registerContent> variableValues; //FIXME: possible bug: gets deleted at end of function
 
     struct user_regs_struct debuggeeRegisters;
-    C_TRYCATCH2(ptrace(PTRACE_GETREGS, debuggee, nullptr, &debuggeeRegisters));
+    C_TRYCATCH(ptrace(PTRACE_GETREGS, debuggee, nullptr, &debuggeeRegisters));
 
-    for (const std::pair<std::string, std::string>& mapping : variableMap){
-        registerContent varValue = getVarValueFromUser_regs_struct(debuggeeRegisters, mapping.second);
-        variableValues.insert(std::pair<std::string, registerContent>(mapping.first, varValue));
+    for (const std::pair<std::string, std::string>& varToReg_mapping : variableMap){
+        registerContent varValue = getVarValueFromUser_regs_struct(debuggeeRegisters, varToReg_mapping.second);
+        variableValues.insert(std::pair<std::string, registerContent>(varToReg_mapping.first, varValue));
     }
 
     return variableValues;
@@ -207,7 +229,7 @@ std::map<std::string, registerContent> storeVariables(const std::map<std::string
 
 //Informs user (prints to screen) that variable varName changed from oldValue to newValue in inspected code
 void printDifference(const std::string& varName, const registerContent oldValue, const registerContent newValue){
-    C_TRYCATCH2(printf("PRF:: %s: %lld->%lld\n", varName.c_str(), oldValue, newValue));
+    C_TRYCATCH(printf("PRF:: %s: %lld->%lld\n", varName.c_str(), oldValue, newValue));
 }
 
 //compare data from requested variables with previous data on them, print to user
@@ -216,27 +238,27 @@ void compareVariables(
         const std::map<std::string,std::string>& variableMap,
         pid_t debuggee){
 
-    const std::map<std::string, registerContent> newVariableValues = storeVariables(variableMap, debuggee);
+    std::map<std::string, registerContent> newVariableValues = storeVariables(variableMap, debuggee);
 
     for (const std::pair<std::string, registerContent>& oldVariable : oldVariableValues){
-        const std::pair<std::string, registerContent>& newVariable = newVariableValues[oldVariable.first];
-        if (oldVariable.second != newVariable.second){
-            printDifference(oldVariable.first, oldVariable.second, newVariable.second);
+        const registerContent& newValue = newVariableValues[oldVariable.first];
+        if (oldVariable.second != newValue){
+            printDifference(oldVariable.first, oldVariable.second, newValue);
         }
     }
 }
 
 //signals debuggee (who was waiting in step 3 of loadDebuggedProgram for setup to complete) to get started running
 void startDebuggeeRun(pid_t debuggee){
-    C_TRYCATCH2(ptrace(PTRACE_CONT, debuggee, nullptr, nullptr));
+    C_TRYCATCH(ptrace(PTRACE_CONT, debuggee, nullptr, nullptr));
 }
 
 //manage debugging the code
-void runDebugger(const std::string &programPath, const std::string &programCmd, void *beginAddress, void *endAddress,
+void runDebugger(char *programArgs[], void *beginAddress, void *endAddress,
                  const std::map<std::string, std::string> &variableMap) {
 
     pid_t debuggee;
-    if (!(debuggee = fork())) loadDebuggedProgram(programPath, programCmd); //child process that runs debugged program then exits
+    if (!(debuggee = fork())) loadDebuggedProgram(programArgs); //child process that runs debugged program then exits
     //debugger process continues here
 
     //run debugged process
@@ -246,12 +268,12 @@ void runDebugger(const std::string &programPath, const std::string &programCmd, 
 
     startDebuggeeRun(debuggee);
     do { //FIXME: possible bug: if debuggee receives a signal during run, will return control to debugger before reached inspected code, and debugger will return no signal (instead of caught signal)
-        C_TRYCATCH2(wait(&debuggeeStatus)); //wait for debuggee to reach beginning of inspected code
+        C_TRYCATCH(wait(&debuggeeStatus)); //wait for debuggee to reach beginning of inspected code
         if (WIFEXITED(debuggeeStatus)) break;
         std::map<std::string, registerContent> storedVariables = storeVariables(variableMap, debuggee);
 
         resumeRun(beginAddress, replacedBeginByte, debuggee);
-        C_TRYCATCH2(wait(&debuggeeStatus)); //wait for debuggee to reach end of inspected code
+        C_TRYCATCH(wait(&debuggeeStatus)); //wait for debuggee to reach end of inspected code
         if (WIFEXITED(debuggeeStatus)) break;
         compareVariables(storedVariables, variableMap, debuggee);
         resumeRun(endAddress, replacedEndByte, debuggee);
